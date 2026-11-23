@@ -2,18 +2,21 @@
  * ══════════════════════════════════════════════════════════════════════════════
  * Плагин «Онлайн 4K Ultra HD» для Lampa (lampa.mx, bylampa.online и др.)
  * ══════════════════════════════════════════════════════════════════════════════
- * Версия: 2.1.0 (Публичная сборка для GitHub)
+ * Версия: 2.2.0 (Универсальная сборка для GitHub / Local / Smart TV)
  *
  * Возможности:
  * 1. Бесплатный просмотр фильмов и сериалов в 4K UHD (2160p) и 2K (1440p) онлайн.
  *    (ТОРРЕНТЫ И TORRSERVER НЕ ТРЕБУЮТСЯ).
- * 2. Автономность: работает везде (Smart TV, Android TV, ПК, MSX, bylampa, lampa.mx).
- * 3. Поддержка мульти-балансеров (Alloha 4K + Filmix fallback).
- * 4. Автоматический выбор максимального разрешения 2160p.
- * 5. Расширенный буфер HLS (манифест 30с, ретрай 60с) против буферизации тяжелых 4K-стримов.
- * 6. Полная поддержка сериалов (сезоны, озвучки, серии, плейлист).
- * 7. Чистый открытый код БЕЗ ОБФУСКАЦИИ и БЕЗ привязки к доменам.
- * 8. Меню настроек в Lampa (выбор сервера, качества, буфера и автозапуска).
+ * 2. Полная интеграция с карточкой фильма Lampa:
+ *    - Заменяет стандартное открытие трейлеров при нажатии кнопки «Смотреть» на запуск 4K!
+ *    - Добавляет видимую золотую кнопку «4K» рядом с основной кнопкой воспроизведения.
+ *    - Регистрируется в нативном контейнере источников Lampa (buttons--container).
+ *    - Добавляет пункт «Онлайн 4K Ultra HD» в меню дополнительных действий (...).
+ * 3. Поддержка парсинга как чистого JSON, так и HTML data-json ответов балансеров.
+ * 4. Автоматическое определение максимального разрешения (2160p / 1440p / 1080p).
+ * 5. Расширенный буфер HLS против буферизации тяжелых 4K-потоков.
+ * 6. Меню настроек в Lampa (выбор балансера, разрешения, автозапуска).
+ * 7. Чистый открытый код без обфускации и привязки к доменам.
  * ══════════════════════════════════════════════════════════════════════════════
  */
 
@@ -24,7 +27,7 @@
   window.plugin_online_4k_ready = true;
 
   var PLUGIN_NAME = 'Онлайн 4K';
-  var PLUGIN_VERSION = '2.1.0';
+  var PLUGIN_VERSION = '2.2.0';
 
   /* -------------------------------------------------------------------------- */
   /*                                 НАСТРОЙКИ                                  */
@@ -32,444 +35,555 @@
 
   var DEFAULT_SERVERS = [
     'http://88.218.62.180:9118',
-    'http://94.142.140.142:9118'
+    'http://lampac.sh/lite',
+    'https://lampac.stream'
   ];
 
-  function getStorage(key, def) {
-    try {
-      var v = Lampa.Storage.get(key);
-      if (v === undefined || v === null || v === '' || v === 'undefined') return def;
-      if (v === 'true') return true;
-      if (v === 'false') return false;
-      return v;
-    } catch (e) {
-      return def;
+  function getBaseUrl() {
+    var custom = Lampa.Storage.get('fourk_custom_server', '');
+    if (custom && custom.trim()) {
+      var s = custom.trim();
+      if (!s.startsWith('http')) s = 'http://' + s;
+      return s.replace(/\/+$/, '');
     }
+    return DEFAULT_SERVERS[0];
   }
 
-  function getActiveServers() {
-    var custom = getStorage('fourk_server_url', '').trim();
-    if (custom) {
-      return [custom.replace(/\/+$/, '')].concat(DEFAULT_SERVERS);
+  function getPreferredQuality() {
+    return Lampa.Storage.get('fourk_quality', '2160');
+  }
+
+  /* -------------------------------------------------------------------------- */
+  /*                            СЕТЕВЫЕ ЗАПРОСЫ И ПАРСИНГ                        */
+  /* -------------------------------------------------------------------------- */
+
+  /**
+   * Универсальный парсер ответов балансеров:
+   * обрабатывает чистый JSON, массивы, а также HTML со встроенными data-json='...'
+   */
+  function parseResponseData(raw) {
+    if (!raw) return [];
+    if (typeof raw === 'object') {
+      if (Array.isArray(raw)) return raw;
+      if (raw.channels && Array.isArray(raw.channels)) return raw.channels;
+      return [raw];
     }
-    return DEFAULT_SERVERS;
-  }
 
-  function isForce4K() { return getStorage('fourk_force_quality', true) === true; }
-  function isStableHLS() { return getStorage('fourk_stable_hls', true) === true; }
-  function isAutoStart() { return getStorage('fourk_auto_start', false) === true; }
-  function getTargetQuality() { return String(getStorage('fourk_target_res', '2160')); }
+    var str = (raw + '').trim();
 
-  function applyPlayerSettings() {
-    try {
-      if (isForce4K()) {
-        Lampa.Storage.set('video_quality_default', getTargetQuality());
-      }
-    } catch (e) {}
-  }
-
-  // Расширенный буфер для стабильного 4K стриминга
-  try {
-    var origPlaydata = Lampa.Player.playdata;
-    Lampa.Player.playdata = function () {
-      var w = origPlaydata ? origPlaydata.apply(this, arguments) : {};
+    // 1. Попытка распарсить как чистый JSON
+    if (str.startsWith('{') || str.startsWith('[')) {
       try {
-        if (w && isStableHLS()) {
-          var mTime = parseInt(w.hls_manifest_timeout, 10) || 0;
-          var rTime = parseInt(w.hls_retry_timeout, 10) || 0;
-          if (mTime < 30000) w.hls_manifest_timeout = 30000;
-          if (rTime < 60000) w.hls_retry_timeout = 60000;
-        }
+        var parsed = JSON.parse(str);
+        if (Array.isArray(parsed)) return parsed;
+        if (parsed.channels && Array.isArray(parsed.channels)) return parsed.channels;
+        return [parsed];
       } catch (e) {}
-      return w;
-    };
-  } catch (e) {}
+    }
 
-  /* -------------------------------------------------------------------------- */
-  /*                               СЕТЕВОЙ СЛОЙ                                 */
-  /* -------------------------------------------------------------------------- */
+    // 2. Парсинг из HTML атрибутов data-json='...'
+    var items = [];
+    var regex = /data-json=(['"])(.*?)\1/g;
+    var match;
+    while ((match = regex.exec(str)) !== null) {
+      try {
+        var unescaped = match[2]
+          .replace(/&quot;/g, '"')
+          .replace(/&#39;/g, "'")
+          .replace(/&amp;/g, '&')
+          .replace(/&lt;/g, '<')
+          .replace(/&gt;/g, '>');
+        var obj = JSON.parse(unescaped);
+        items.push(obj);
+      } catch (e) {}
+    }
 
-  function requestText(url) {
-    return new Promise(function (resolve, reject) {
-      var network = new Lampa.Reguest();
-      network.timeout(25000);
-      network.native(
+    return items;
+  }
+
+  /**
+   * Выполнение сетевого запроса через Lampa.Reguest / fetch
+   */
+  function request(url, callback, errorCallback) {
+    if (Lampa.Reguest) {
+      Lampa.Reguest.native(
         url,
-        function (result) {
-          if (typeof result === 'string') resolve(result);
-          else if (result && typeof result === 'object') {
-            try { resolve(JSON.stringify(result)); } catch (e) { resolve(String(result)); }
-          } else resolve('');
+        function (res) {
+          callback(res);
         },
-        function (xhr) {
-          if (location.protocol === 'https:' && (!xhr || xhr.status === 0) && !Lampa.Platform.is('android')) {
-            reject(
-              'Браузер заблокировал HTTP-запрос (Mixed Content). Для работы онлайн-балансеров в браузере откройте http://lampa.mx (без буквы S) или разрешите небезопасный контент в настройках сайта. На ТВ и Android TV работает автоматически.'
-            );
-          } else {
-            var status = xhr && xhr.status ? xhr.status : 'ERR';
-            reject('Сервер не отвечает (' + status + ')');
-          }
+        function (err) {
+          if (errorCallback) errorCallback(err);
         },
         false,
         { dataType: 'text' }
       );
-    });
-  }
-
-  function requestJson(url) {
-    return requestText(url).then(function (text) {
-      try { return JSON.parse(text); } catch (e) { throw new Error('Некорректный ответ балансера'); }
-    });
-  }
-
-  // Запрос с автоматическим перебором зеркал
-  function requestWithMirrors(pathBuilder) {
-    var servers = getActiveServers();
-    var lastError = null;
-
-    function tryServer(index) {
-      if (index >= servers.length) {
-        return Promise.reject(lastError || new Error('Все серверы балансера недоступны'));
-      }
-      var fullUrl = servers[index] + pathBuilder;
-      return requestText(fullUrl).catch(function (err) {
-        lastError = err;
-        return tryServer(index + 1);
-      });
+      return;
     }
 
-    return tryServer(0);
+    fetch(url)
+      .then(function (res) { return res.text(); })
+      .then(function (text) { callback(text); })
+      .catch(function (err) { if (errorCallback) errorCallback(err); });
   }
 
   /* -------------------------------------------------------------------------- */
-  /*                           ПАРСИНГ И ПОИСК 4K                               */
+  /*                           БАЛАНСЕР 1: ALLOHA 4K                           */
   /* -------------------------------------------------------------------------- */
 
-  function buildSearchParams(movie) {
-    var p = [];
-    p.push('id=' + encodeURIComponent(movie.id || ''));
-    if (movie.imdb_id) p.push('imdb_id=' + encodeURIComponent(movie.imdb_id));
-    if (movie.kinopoisk_id) p.push('kinopoisk_id=' + encodeURIComponent(movie.kinopoisk_id));
-    p.push('title=' + encodeURIComponent(movie.title || movie.name || ''));
-    p.push('original_title=' + encodeURIComponent(movie.original_title || movie.original_name || ''));
-    var isSerial = (movie.name || movie.number_of_seasons || movie.first_air_date) ? 1 : 0;
-    p.push('serial=' + isSerial);
-    p.push('year=' + encodeURIComponent(((movie.release_date || movie.first_air_date || '0000') + '').slice(0, 4)));
-    p.push('source=' + encodeURIComponent(movie.source || 'tmdb'));
-    return p.join('&');
-  }
+  function searchAlloha(movie, callback) {
+    var base = getBaseUrl();
+    var query = movie.title || movie.name || '';
+    var year = (movie.release_date || movie.first_air_date || '').slice(0, 4);
+    var searchUrl = base + '/lite/alloha?title=' + encodeURIComponent(query);
+    if (year) searchUrl += '&year=' + encodeURIComponent(year);
 
-  function parseDataItems(html) {
-    var box = document.createElement('div');
-    box.innerHTML = html;
-    var out = [];
-    var els = box.querySelectorAll('[data-json]');
-    for (var i = 0; i < els.length; i++) {
-      try {
-        var raw = els[i].getAttribute('data-json');
-        if (!raw) continue;
-        var j = JSON.parse(raw);
-        j._text = (els[i].textContent || '').trim();
-        j._s = els[i].getAttribute('s');
-        j._e = els[i].getAttribute('e');
-        out.push(j);
-      } catch (e) {}
-    }
-    return out;
-  }
+    request(
+      searchUrl,
+      function (raw) {
+        var items = parseResponseData(raw);
+        if (!items.length) {
+          callback(null);
+          return;
+        }
 
-  function detectQualityBadge(item) {
-    var str = [item.maxquality, item.quality, item.voice_name, item.translate, item.title, item._text].filter(Boolean).join(' ').toLowerCase();
-    if (str.indexOf('2160') >= 0 || str.indexOf('4k') >= 0 || str.indexOf('uhd') >= 0) return '4K UHD';
-    if (str.indexOf('1440') >= 0 || str.indexOf('2k') >= 0 || str.indexOf('qhd') >= 0) return '2K QHD';
-    if (str.indexOf('1080') >= 0) return '1080p';
-    return '';
-  }
+        // Ищем точное совпадение по году или первому элементу
+        var target = null;
+        if (year) {
+          target = items.find(function (it) { return it.year && String(it.year) === String(year); });
+        }
+        if (!target) target = items[0];
 
-  function formatItemTitle(item) {
-    var title = item.name || item.translate || item._text || item.title || '';
-    if (item._e) title = 'Серия ' + item._e + (title ? ' · ' + title : '');
-    else if (item._s) title = 'Сезон ' + item._s + (title ? ' · ' + title : '');
-    var badge = detectQualityBadge(item);
-    if (badge) title += ' [' + (badge === '4K UHD' ? '🌟 4K UHD' : badge) + ']';
-    if (item.details) title += ' · ' + item.details;
-    return title.trim() || 'Источник';
+        // Если это ссылка на список переводов / серий
+        if (target.method === 'link' && target.url) {
+          request(
+            target.url,
+            function (subRaw) {
+              var voices = parseResponseData(subRaw);
+              if (voices.length) {
+                callback({ type: 'alloha', voices: voices, movie: movie });
+              } else {
+                callback(null);
+              }
+            },
+            function () { callback(null); }
+          );
+        } else if (target.stream || target.url) {
+          callback({ type: 'alloha', voices: [target], movie: movie });
+        } else {
+          callback(null);
+        }
+      },
+      function () { callback(null); }
+    );
   }
 
   /* -------------------------------------------------------------------------- */
-  /*                       РЕЗОЛВИНГ И ЗАПУСК ВИДЕО                             */
+  /*                           БАЛАНСЕР 2: FILMIX 4K                            */
   /* -------------------------------------------------------------------------- */
 
-  function resolveStream(item) {
-    if (item.method === 'play' && item.url) return Promise.resolve(extractBestStream(item));
-    if (item.method === 'call' && item.url) {
-      return requestJson(item.url).then(function (res) {
-        if (!res || !res.url) throw new Error('Балансер не вернул видеопоток');
-        return extractBestStream(res);
-      });
-    }
-    if (item.stream) return Promise.resolve({ url: item.stream, quality: item.quality || {} });
-    return Promise.reject('Неизвестный источник');
-  }
+  function searchFilmix(movie, callback) {
+    var base = getBaseUrl();
+    var query = movie.title || movie.name || '';
+    var year = (movie.release_date || movie.first_air_date || '').slice(0, 4);
+    var searchUrl = base + '/lite/filmix?title=' + encodeURIComponent(query);
+    if (year) searchUrl += '&year=' + encodeURIComponent(year);
 
-  function extractBestStream(res) {
-    var playUrl = res.url || '';
-    var qualities = res.quality || {};
+    request(
+      searchUrl,
+      function (raw) {
+        var items = parseResponseData(raw);
+        if (!items.length) {
+          callback(null);
+          return;
+        }
 
-    if (isForce4K()) {
-      var target = getTargetQuality() + 'p';
-      if (qualities[target]) playUrl = qualities[target];
-      else if (qualities['2160p']) playUrl = qualities['2160p'];
-      else if (qualities['1440p'] && getTargetQuality() !== '1080') playUrl = qualities['1440p'];
-    }
+        // Формируем список доступных качеств для Filmix
+        var results = items.map(function (it) {
+          var qualities = {};
+          var streamUrl = it.url || it.stream || '';
 
-    if (playUrl.indexOf(' or ') !== -1) {
-      playUrl = playUrl.split(' or ')[0];
-    }
+          if (streamUrl.indexOf('_480.mp4') !== -1) {
+            qualities['2160p'] = streamUrl.replace('_480.mp4', '_2160.mp4');
+            qualities['1440p'] = streamUrl.replace('_480.mp4', '_1440.mp4');
+            qualities['1080p'] = streamUrl.replace('_480.mp4', '_1080.mp4');
+            qualities['720p'] = streamUrl.replace('_480.mp4', '_720.mp4');
+            qualities['480p'] = streamUrl;
+          } else if (it.quality) {
+            qualities = it.quality;
+          }
 
-    return {
-      url: playUrl,
-      quality: qualities,
-      subtitles: res.subtitles || []
-    };
-  }
+          var maxQ = '1080p';
+          if (qualities['2160p'] || (it.title && it.title.indexOf('4K') !== -1)) maxQ = '2160p 4K';
+          else if (qualities['1440p']) maxQ = '1440p 2K';
 
-  function startPlayer(movie, chosen, resolved, playlist) {
-    applyPlayerSettings();
-    var title = movie.title || movie.name || '';
-    var subtitle = chosen.translate || chosen.name || chosen._text || '';
-
-    var playdata = {
-      url: resolved.url,
-      title: title + (subtitle ? ' — ' + subtitle : ''),
-      quality: resolved.quality,
-      subtitles: resolved.subtitles,
-      hls_manifest_timeout: isStableHLS() ? 30000 : 10000,
-      hls_retry_timeout: isStableHLS() ? 60000 : 30000
-    };
-
-    if (chosen._s) playdata.season = parseInt(chosen._s, 10);
-    if (chosen._e) playdata.episode = parseInt(chosen._e, 10);
-
-    Lampa.Loading.stop();
-    Lampa.Player.play(playdata);
-
-    if (playlist && playlist.length > 1) {
-      Lampa.Player.playlist(playlist.map(function (it) {
-        return {
-          title: formatItemTitle(it),
-          url: it.stream || it.url,
-          season: it._s ? parseInt(it._s, 10) : undefined,
-          episode: it._e ? parseInt(it._e, 10) : undefined
-        };
-      }));
-    }
-  }
-
-  /* -------------------------------------------------------------------------- */
-  /*                       ИНТЕРАКТИВНОЕ МЕНЮ ВЫБОРА                            */
-  /* -------------------------------------------------------------------------- */
-
-  function pickItem(title, items) {
-    return new Promise(function (resolve) {
-      if (!items || !items.length) { resolve(null); return; }
-
-      // 4K всегда на первом месте
-      var sorted = items.slice().sort(function (a, b) {
-        var a4k = detectQualityBadge(a) === '4K UHD' ? 1 : 0;
-        var b4k = detectQualityBadge(b) === '4K UHD' ? 1 : 0;
-        return b4k - a4k;
-      });
-
-      if (isAutoStart() && sorted.length > 0 && detectQualityBadge(sorted[0]) === '4K UHD') {
-        resolve(sorted[0]);
-        return;
-      }
-
-      var list = sorted.map(function (it, idx) {
-        return { title: formatItemTitle(it), _index: idx };
-      });
-
-      Lampa.Loading.stop();
-      Lampa.Select.show({
-        title: title,
-        items: list,
-        onSelect: function (sel) { resolve(sorted[sel._index]); },
-        onBack: function () { resolve(null); }
-      });
-    });
-  }
-
-  function walkTree(movie, url, state, depth) {
-    if (depth > 6) return Promise.reject('Превышена глубина меню');
-
-    return requestText(url).then(function (html) {
-      if (!html || !html.trim()) throw new Error('Пустой ответ балансера');
-      var items = parseDataItems(html);
-      if (!items.length) throw new Error('Источники не найдены');
-
-      var links = items.filter(function (x) { return x.method === 'link' && x.url; });
-      var playables = items.filter(function (x) { return x.method === 'call' || x.method === 'play' || x.stream; });
-
-      if (links.length > 0 && !playables.length) {
-        var isSeasons = links.some(function (x) { return /[?&]s=\d/.test(x.url); });
-        var isVoices = links.some(function (x) { return /[?&]t=\d/.test(x.url); });
-        var menuTitle = isVoices ? 'Выберите озвучку (4K сверху)' : isSeasons ? 'Выберите сезон' : 'Выберите релиз';
-
-        return pickItem(menuTitle, links).then(function (chosen) {
-          if (!chosen) return;
-          return walkTree(movie, chosen.url, state, depth + 1);
+          return {
+            title: it.title || 'Filmix',
+            maxquality: maxQ,
+            qualities: qualities,
+            url: qualities['2160p'] || qualities['1080p'] || streamUrl
+          };
         });
-      }
 
-      if (playables.length > 0) {
-        var isEpisodes = playables.some(function (x) { return x._e; });
-        var selectTitle = isEpisodes ? 'Выберите серию' : 'Выберите дорожку (4K UHD)';
-
-        return pickItem(selectTitle, playables).then(function (chosen) {
-          if (!chosen) return;
-          Lampa.Loading.start();
-          return resolveStream(chosen).then(function (resolved) {
-            startPlayer(movie, chosen, resolved, playables);
-          });
-        });
-      }
-
-      throw new Error('Подходящих видеопотоков не найдено');
-    });
+        callback({ type: 'filmix', voices: results, movie: movie });
+      },
+      function () { callback(null); }
+    );
   }
+
+  /* -------------------------------------------------------------------------- */
+  /*                         ПОДГОТОВКА ПОТОКА К ПРОСМОТРУ                      */
+  /* -------------------------------------------------------------------------- */
+
+  function resolveStream(voiceItem, callback) {
+    if (voiceItem.qualities && Object.keys(voiceItem.qualities).length) {
+      callback({
+        url: voiceItem.qualities['2160p'] || voiceItem.qualities['1440p'] || voiceItem.qualities['1080p'] || voiceItem.url,
+        qualities: voiceItem.qualities
+      });
+      return;
+    }
+
+    if (voiceItem.method === 'call' && voiceItem.url) {
+      request(
+        voiceItem.url,
+        function (resRaw) {
+          var parsed = parseResponseData(resRaw);
+          var playData = parsed[0] || {};
+          var finalUrl = playData.url || playData.stream || voiceItem.stream;
+          var qualities = playData.quality || {};
+          callback({ url: finalUrl, qualities: qualities, segments: playData.segments });
+        },
+        function () {
+          callback({ url: voiceItem.stream, qualities: {} });
+        }
+      );
+    } else {
+      callback({ url: voiceItem.stream || voiceItem.url, qualities: voiceItem.quality || {} });
+    }
+  }
+
+  /* -------------------------------------------------------------------------- */
+  /*                           ЗАПУСК ПЛЕЕРА LAMPA                             */
+  /* -------------------------------------------------------------------------- */
+
+  function play(streamInfo, voiceItem, movie) {
+    if (!streamInfo.url) {
+      Lampa.Noty.show('Онлайн 4K: Ошибка получения ссылки на поток.');
+      return;
+    }
+
+    var chosenUrl = streamInfo.url;
+    var pref = getPreferredQuality();
+
+    if (streamInfo.qualities) {
+      if (pref === '2160' && streamInfo.qualities['2160p']) chosenUrl = streamInfo.qualities['2160p'];
+      else if (pref === '1440' && streamInfo.qualities['1440p']) chosenUrl = streamInfo.qualities['1440p'];
+      else if (streamInfo.qualities['2160p']) chosenUrl = streamInfo.qualities['2160p'];
+      else if (streamInfo.qualities['1080p']) chosenUrl = streamInfo.qualities['1080p'];
+    }
+
+    var playObject = {
+      title: (movie.title || movie.name || '') + ' (' + (voiceItem.translate || voiceItem.title || '4K') + ')',
+      url: chosenUrl,
+      quality: streamInfo.qualities || {},
+      timeline: {
+        hash: Lampa.Utils.hash(movie.original_title || movie.title || 'movie_4k'),
+        percent: 0,
+        time: 0,
+        duration: 0
+      }
+    };
+
+    // Настройка таймаутов буфера для стабильного 4K
+    if (Lampa.Storage.get('fourk_stable_hls', true)) {
+      playObject.hls_manifest_timeout = 30000;
+      playObject.hls_retry_timeout = 60000;
+    }
+
+    if (streamInfo.segments && streamInfo.segments.skip) {
+      playObject.segments = streamInfo.segments;
+    }
+
+    Lampa.Player.play(playObject);
+    Lampa.Player.playlist([playObject]);
+  }
+
+  /* -------------------------------------------------------------------------- */
+  /*                        ГЛАВНАЯ ТОЧКА ВХОДА (LAUNCH)                        */
+  /* -------------------------------------------------------------------------- */
 
   function launch(movie) {
     if (!movie) return;
-    try { Lampa.Loading.start(); } catch (e) {}
 
-    var query = buildSearchParams(movie);
+    Lampa.Loading.start(function () {
+      Lampa.Loading.stop();
+    });
 
-    // Сначала ищем в Alloha (главный источник 4K UHD)
-    requestWithMirrors('/lite/alloha?' + query)
-      .then(function (html) {
-        var items = parseDataItems(html);
-        if (items.length > 0) {
-          return walkTree(movie, getActiveServers()[0] + '/lite/alloha?' + query, {}, 0);
+    // 1. Сначала ищем в Alloha 4K
+    searchAlloha(movie, function (resAlloha) {
+      if (resAlloha && resAlloha.voices && resAlloha.voices.length) {
+        Lampa.Loading.stop();
+        showVoiceSelector(resAlloha.voices, movie);
+        return;
+      }
+
+      // 2. Если в Alloha нет, ищем в Filmix 4K
+      searchFilmix(movie, function (resFilmix) {
+        Lampa.Loading.stop();
+        if (resFilmix && resFilmix.voices && resFilmix.voices.length) {
+          showVoiceSelector(resFilmix.voices, movie);
+          return;
         }
-        // Если в Alloha нет, ищем в Filmix
-        return walkTree(movie, getActiveServers()[0] + '/lite/filmix?' + query, {}, 0);
-      })
-      .catch(function (err) {
-        try { Lampa.Loading.stop(); } catch (e) {}
-        var msg = (err && err.message) || String(err) || 'Ошибка загрузки';
-        console.error('4K Plugin Error:', err);
-        try { Lampa.Noty.show('4K Онлайн: ' + msg); } catch (x) {}
+
+        // Если источников нет (например, не вышедший фильм из трейлеров)
+        Lampa.Noty.show('Онлайн 4K: Потоки не найдены. Возможно, релиз еще не вышел в цифровой прокат.');
       });
+    });
+  }
+
+  function showVoiceSelector(voices, movie) {
+    // Если всего 1 голос и включен автозапуск
+    if (voices.length === 1 && Lampa.Storage.get('fourk_auto_start', false)) {
+      resolveStream(voices[0], function (info) {
+        play(info, voices[0], movie);
+      });
+      return;
+    }
+
+    var items = voices.map(function (v) {
+      var name = v.translate || v.title || v.voice_name || 'Основная озвучка';
+      var qualityBadge = v.maxquality ? ' [' + v.maxquality + ']' : ' [4K UHD]';
+      return {
+        title: name + qualityBadge,
+        subtitle: v.voice_name ? 'Тип: ' + v.voice_name : 'Качество: 2160p Ultra HD',
+        item: v
+      };
+    });
+
+    Lampa.Select.show({
+      title: 'Онлайн 4K — Выбор озвучки',
+      items: items,
+      onSelect: function (selected) {
+        Lampa.Loading.start(function () { Lampa.Loading.stop(); });
+        resolveStream(selected.item, function (info) {
+          Lampa.Loading.stop();
+          play(info, selected.item, movie);
+        });
+      },
+      onBack: function () {
+        Lampa.Controller.toggle('content');
+      }
+    });
   }
 
   /* -------------------------------------------------------------------------- */
-  /*                          КНОПКА НА КАРТОЧКЕ ФИЛЬМА                         */
+  /*                   ИНТЕГРАЦИЯ В КАРТОЧКУ ФИЛЬМА (КНОПКИ)                    */
   /* -------------------------------------------------------------------------- */
 
-  Lampa.Listener.follow('full', function (e) {
-    if (e.type === 'complite') {
-      try {
-        var card = e.object.activity.render();
-        var movie = e.data.movie;
-        if (!card.find('.button--online-4k').length) {
-          var btn = $(
-            '<div class="full-start__button selector button--online-4k">' +
-              '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="vertical-align: middle; margin-right: 8px;">' +
-                '<rect x="2" y="4" width="20" height="16" rx="3" stroke="#ffc107" stroke-width="2"/>' +
-                '<text x="12" y="15.5" text-anchor="middle" font-family="sans-serif" font-size="9" font-weight="900" fill="#ffc107">4K</text>' +
-              '</svg>' +
-              '<span>Смотреть 4K</span>' +
-            '</div>'
-          );
-          btn.on('hover:enter', function () { launch(movie); });
-          var container = card.find('.full-start-new__buttons, .full-start__buttons');
-          if (container.length) container.prepend(btn);
-        }
-      } catch (err) {}
-    }
-  });
+  function attachButtons(card, movie) {
+    if (!card || !card.length || !movie) return;
 
-  /* -------------------------------------------------------------------------- */
-  /*                       РЕГИСТРАЦИЯ В КОНТЕКСТНОМ МЕНЮ                       */
-  /* -------------------------------------------------------------------------- */
+    // 1. Добавляем в нативный .buttons--container Lampa
+    // Это гарантирует, что Lampa onGroupButtons и onWatch видят наш плагин как основной источник!
+    var btnsContainer = card.find('.buttons--container');
+    if (!card.find('.button--online-4k-source').length) {
+      var sourceBtn = $(
+        '<div class="full-start__button selector view--online button--online-4k-source" data-subtitle="Онлайн 4K Ultra HD">' +
+          '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="vertical-align: middle; margin-right: 8px;">' +
+            '<circle cx="12" cy="12" r="10" stroke="#ffc107" stroke-width="2"/>' +
+            '<polygon points="10,8 16,12 10,16" fill="#ffc107"/>' +
+          '</svg>' +
+          '<span>4K Онлайн</span>' +
+        '</div>'
+      );
 
-  try {
-    var manifest = {
-      type: 'video',
-      version: PLUGIN_VERSION,
-      name: 'Онлайн 4K',
-      description: 'Бесплатный онлайн просмотр в 4K UHD без торрентов',
-      component: 'online_4k',
-      onContextMenu: function () {
-        return { name: 'Смотреть в 4K UHD', description: 'Поиск 2160p онлайн' };
-      },
-      onContextLauch: function (movie) { launch(movie); }
-    };
+      sourceBtn.on('hover:enter', function () {
+        launch(movie);
+      });
 
-    var plugins = Lampa.Manifest.plugins;
-    if (Array.isArray(plugins)) {
-      for (var i = plugins.length - 1; i >= 0; i--) {
-        if (plugins[i] && plugins[i].component === 'online_4k') plugins.splice(i, 1);
+      var torrentBtn = card.find('.view--torrent');
+      if (torrentBtn.length) {
+        torrentBtn.after(sourceBtn);
+      } else if (btnsContainer.length) {
+        btnsContainer.prepend(sourceBtn);
       }
     }
-    Lampa.Manifest.plugins = manifest;
-  } catch (e) {}
 
-  /* -------------------------------------------------------------------------- */
-  /*                             НАСТРОЙКИ В МЕНЮ                               */
-  /* -------------------------------------------------------------------------- */
+    // 2. Добавляем ВИДИМУЮ золотую кнопку «4K» в панель кнопок (.full-start-new__buttons)
+    if (!card.find('.button--online-4k-visible').length) {
+      var visibleBtn = $(
+        '<div class="full-start__button selector button--online-4k-visible" title="Смотреть в 4K Ultra HD" style="cursor: pointer;">' +
+          '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="display: block; margin: auto;">' +
+            '<rect x="2" y="3.5" width="20" height="17" rx="3.5" stroke="#ffc107" stroke-width="2.2"/>' +
+            '<text x="12" y="15.5" text-anchor="middle" font-family="Arial, sans-serif" font-size="9.5" font-weight="900" fill="#ffc107">4K</text>' +
+          '</svg>' +
+          '<span>Смотреть 4K</span>' +
+        '</div>'
+      );
 
-  try {
-    if (Lampa.SettingsApi && Lampa.SettingsApi.addComponent) {
-      Lampa.SettingsApi.addComponent({
-        component: 'online_4k',
-        icon: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="2" y="4" width="20" height="16" rx="3" stroke="#ffffff" stroke-width="2"/><text x="12" y="15.5" text-anchor="middle" font-family="sans-serif" font-size="9" font-weight="900" fill="#ffffff">4K</text></svg>',
-        name: 'Онлайн 4K'
+      visibleBtn.on('hover:enter', function () {
+        launch(movie);
       });
 
-      Lampa.SettingsApi.addParam({
-        component: 'online_4k',
-        param: { name: 'fourk_server_url', type: 'input', default: '' },
-        field: { name: 'Пользовательский сервер', description: 'Оставьте пустым для встроенных серверов' }
+      visibleBtn.on('hover:focus hover:hover', function () {
+        try {
+          if (Lampa.Activity.active() && Lampa.Activity.active().activity) {
+            Lampa.Activity.active().activity.last = visibleBtn[0];
+          }
+        } catch (e) {}
       });
 
-      Lampa.SettingsApi.addParam({
-        component: 'online_4k',
-        param: {
-          name: 'fourk_target_res',
-          type: 'select',
-          values: { '2160': '2160p (4K UHD)', '1440': '1440p (2K QHD)', '1080': '1080p Full HD' },
-          default: '2160'
-        },
-        field: { name: 'Приоритетное разрешение', description: 'Выбирать данное качество при наличии в источнике' },
-        onChange: applyPlayerSettings
-      });
+      var playBtn = card.find('.button--play');
+      if (playBtn.length) {
+        playBtn.after(visibleBtn);
+      } else {
+        var buttonsRow = card.find('.full-start-new__buttons, .full-start__buttons');
+        if (buttonsRow.length) buttonsRow.prepend(visibleBtn);
+      }
+    }
 
-      Lampa.SettingsApi.addParam({
-        component: 'online_4k',
-        param: { name: 'fourk_force_quality', type: 'trigger', default: true },
-        field: { name: 'Принудительно высокое качество', description: 'Фиксировать разрешение плеера Lampa на 2160p' },
-        onChange: applyPlayerSettings
-      });
-
-      Lampa.SettingsApi.addParam({
-        component: 'online_4k',
-        param: { name: 'fourk_stable_hls', type: 'trigger', default: true },
-        field: { name: 'Стабильный буфер 4K', description: 'Расширенные таймауты HLS (30с/60с) против буферизации' }
-      });
-
-      Lampa.SettingsApi.addParam({
-        component: 'online_4k',
-        param: { name: 'fourk_auto_start', type: 'trigger', default: false },
-        field: { name: 'Автозапуск 4K', description: 'Стартовать видео сразу без показа диалога выбора' }
+    // 3. ПЕРЕХВАТЫВАЕМ нажатие на стандартную круглую кнопку «Смотреть» (.button--play)
+    // Чтобы клик по «Смотреть» сразу запускал 4K онлайн, а не уходил в YouTube-трейлеры!
+    var mainPlayBtn = card.find('.button--play');
+    if (mainPlayBtn.length) {
+      mainPlayBtn.off('hover:enter.online4k').on('hover:enter.online4k', function (e) {
+        e.stopImmediatePropagation();
+        e.stopPropagation();
+        launch(movie);
       });
     }
-  } catch (e) {}
+  }
 
-  applyPlayerSettings();
+  function setupFullCardHook() {
+    Lampa.Listener.follow('full', function (e) {
+      if (e.type === 'complite') {
+        var card = e.body || (e.object && e.object.activity && e.object.activity.render()) || (Lampa.Activity.active() && Lampa.Activity.active().activity && Lampa.Activity.active().activity.render());
+        var movie = (e.data && e.data.movie) || (e.object && e.object.card) || (Lampa.Activity.active() && Lampa.Activity.active().card);
 
-  window.plugin_online_4k_launch = launch;
-  console.log('4K Plugin loaded. Version: ' + PLUGIN_VERSION);
+        if (card && movie) {
+          // Вызываем сразу
+          attachButtons(card, movie);
+          // И с задержками (на случай, если Lampa groupButtons перестроит DOM)
+          setTimeout(function () { attachButtons(card, movie); }, 60);
+          setTimeout(function () { attachButtons(card, movie); }, 250);
+          setTimeout(function () { attachButtons(card, movie); }, 600);
+        }
+      } else if (e.type === 'options' && e.options) {
+        var optMovie = e.card || (e.object && e.object.card) || (e.link && e.link.card);
+        e.options.push({
+          title: 'Онлайн 4K Ultra HD',
+          icon: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none"><rect x="2" y="4" width="20" height="16" rx="3" stroke="#ffc107" stroke-width="2"/><text x="12" y="15.5" text-anchor="middle" font-size="9" font-weight="900" fill="#ffc107">4K</text></svg>',
+          action: function () {
+            if (optMovie) launch(optMovie);
+          }
+        });
+      }
+    });
+
+    // Если карточка УЖЕ была открыта в момент добавления плагина
+    try {
+      if (Lampa.Activity.active() && Lampa.Activity.active().component === 'full') {
+        var act = Lampa.Activity.active();
+        var currentCard = act.activity.render();
+        var currentMovie = act.card;
+        attachButtons(currentCard, currentMovie);
+      }
+    } catch (e) {}
+  }
+
+  /* -------------------------------------------------------------------------- */
+  /*                               НАСТРОЙКИ LAMPA                              */
+  /* -------------------------------------------------------------------------- */
+
+  function setupSettings() {
+    try {
+      if (Lampa.SettingsApi) {
+        Lampa.SettingsApi.addComponent({
+          component: 'online_4k',
+          name: PLUGIN_NAME,
+          icon: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ffc107" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="3"/><text x="12" y="15.5" text-anchor="middle" font-size="9" font-weight="900" fill="#ffc107">4K</text></svg>'
+        });
+
+        Lampa.SettingsApi.addParam({
+          component: 'online_4k',
+          param: {
+            name: 'fourk_quality',
+            type: 'select',
+            values: {
+              '2160': '4K UHD (2160p)',
+              '1440': '2K QHD (1440p)',
+              '1080': 'Full HD (1080p)'
+            },
+            default: '2160'
+          },
+          field: {
+            name: 'Приоритетное качество',
+            description: 'Выбирать максимальное доступное разрешение'
+          }
+        });
+
+        Lampa.SettingsApi.addParam({
+          component: 'online_4k',
+          param: {
+            name: 'fourk_auto_start',
+            type: 'trigger',
+            default: false
+          },
+          field: {
+            name: 'Автозапуск 4K',
+            description: 'Запускать лучший поток сразу без диалога выбора озвучки'
+          }
+        });
+
+        Lampa.SettingsApi.addParam({
+          component: 'online_4k',
+          param: {
+            name: 'fourk_stable_hls',
+            type: 'trigger',
+            default: true
+          },
+          field: {
+            name: 'Стабильный буфер 4K',
+            description: 'Расширенные таймауты HLS (30с/60с) против прерываний и буферизации'
+          }
+        });
+
+        Lampa.SettingsApi.addParam({
+          component: 'online_4k',
+          param: {
+            name: 'fourk_custom_server',
+            type: 'input',
+            default: ''
+          },
+          field: {
+            name: 'Пользовательский сервер Lampac',
+            description: 'Оставьте пустым для встроенного публичного 4K-сервера'
+          }
+        });
+      }
+    } catch (e) {}
+  }
+
+  /* -------------------------------------------------------------------------- */
+  /*                            СТАРТ И ИНИЦИАЛИЗАЦИЯ                           */
+  /* -------------------------------------------------------------------------- */
+
+  function start() {
+    setupFullCardHook();
+    setupSettings();
+
+    // Экспорт в глобальную область видимости
+    window.plugin_online_4k_launch = launch;
+    console.log(PLUGIN_NAME + ' v' + PLUGIN_VERSION + ' успешно загружен.');
+  }
+
+  if (window.appready) {
+    start();
+  } else if (window.Lampa && Lampa.Listener) {
+    Lampa.Listener.follow('app', function (e) {
+      if (e.type === 'ready') start();
+    });
+  } else {
+    start();
+  }
 })();
