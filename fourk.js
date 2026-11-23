@@ -1,15 +1,39 @@
 /**
+ * ══════════════════════════════════════════════════════════════════════════════
  * Плагин «Онлайн 4K Ultra HD» для Lampa (lampa.mx, bylampa.online и др.)
- * Бесплатный просмотр в 4K UHD (2160p) онлайн БЕЗ торрентов и TorrServer.
+ * ══════════════════════════════════════════════════════════════════════════════
+ * Версия: 2.1.0 (Публичная сборка для GitHub)
+ *
+ * Возможности:
+ * 1. Бесплатный просмотр фильмов и сериалов в 4K UHD (2160p) и 2K (1440p) онлайн.
+ *    (ТОРРЕНТЫ И TORRSERVER НЕ ТРЕБУЮТСЯ).
+ * 2. Автономность: работает везде (Smart TV, Android TV, ПК, MSX, bylampa, lampa.mx).
+ * 3. Поддержка мульти-балансеров (Alloha 4K + Filmix fallback).
+ * 4. Автоматический выбор максимального разрешения 2160p.
+ * 5. Расширенный буфер HLS (манифест 30с, ретрай 60с) против буферизации тяжелых 4K-стримов.
+ * 6. Полная поддержка сериалов (сезоны, озвучки, серии, плейлист).
+ * 7. Чистый открытый код БЕЗ ОБФУСКАЦИИ и БЕЗ привязки к доменам.
+ * 8. Меню настроек в Lampa (выбор сервера, качества, буфера и автозапуска).
+ * ══════════════════════════════════════════════════════════════════════════════
  */
+
 (function () {
   'use strict';
 
   if (window.plugin_online_4k_ready) return;
   window.plugin_online_4k_ready = true;
 
-  var PLUGIN_VERSION = '2.0.0';
-  var DEFAULT_SERVER = 'http://88.218.62.180:9118';
+  var PLUGIN_NAME = 'Онлайн 4K';
+  var PLUGIN_VERSION = '2.1.0';
+
+  /* -------------------------------------------------------------------------- */
+  /*                                 НАСТРОЙКИ                                  */
+  /* -------------------------------------------------------------------------- */
+
+  var DEFAULT_SERVERS = [
+    'http://88.218.62.180:9118',
+    'http://94.142.140.142:9118'
+  ];
 
   function getStorage(key, def) {
     try {
@@ -23,9 +47,12 @@
     }
   }
 
-  function getServer() {
-    var s = getStorage('fourk_server_url', DEFAULT_SERVER);
-    return (s || DEFAULT_SERVER).replace(/\/+$/, '');
+  function getActiveServers() {
+    var custom = getStorage('fourk_server_url', '').trim();
+    if (custom) {
+      return [custom.replace(/\/+$/, '')].concat(DEFAULT_SERVERS);
+    }
+    return DEFAULT_SERVERS;
   }
 
   function isForce4K() { return getStorage('fourk_force_quality', true) === true; }
@@ -58,6 +85,10 @@
     };
   } catch (e) {}
 
+  /* -------------------------------------------------------------------------- */
+  /*                               СЕТЕВОЙ СЛОЙ                                 */
+  /* -------------------------------------------------------------------------- */
+
   function requestText(url) {
     return new Promise(function (resolve, reject) {
       var network = new Lampa.Reguest();
@@ -72,9 +103,12 @@
         },
         function (xhr) {
           if (location.protocol === 'https:' && (!xhr || xhr.status === 0) && !Lampa.Platform.is('android')) {
-            reject('Браузер заблокировал HTTP-запрос (Mixed Content). Запустите Lampa по адресу http://lampa.mx (без HTTPS) или разрешите небезопасный контент в настройках сайта.');
+            reject(
+              'Браузер заблокировал HTTP-запрос (Mixed Content). Для работы онлайн-балансеров в браузере откройте http://lampa.mx (без буквы S) или разрешите небезопасный контент в настройках сайта. На ТВ и Android TV работает автоматически.'
+            );
           } else {
-            reject('Сервер недоступен (' + (xhr && xhr.status ? xhr.status : 'ERR') + ')');
+            var status = xhr && xhr.status ? xhr.status : 'ERR';
+            reject('Сервер не отвечает (' + status + ')');
           }
         },
         false,
@@ -89,8 +123,30 @@
     });
   }
 
-  function buildSearchUrl(movie) {
-    var base = getServer();
+  // Запрос с автоматическим перебором зеркал
+  function requestWithMirrors(pathBuilder) {
+    var servers = getActiveServers();
+    var lastError = null;
+
+    function tryServer(index) {
+      if (index >= servers.length) {
+        return Promise.reject(lastError || new Error('Все серверы балансера недоступны'));
+      }
+      var fullUrl = servers[index] + pathBuilder;
+      return requestText(fullUrl).catch(function (err) {
+        lastError = err;
+        return tryServer(index + 1);
+      });
+    }
+
+    return tryServer(0);
+  }
+
+  /* -------------------------------------------------------------------------- */
+  /*                           ПАРСИНГ И ПОИСК 4K                               */
+  /* -------------------------------------------------------------------------- */
+
+  function buildSearchParams(movie) {
     var p = [];
     p.push('id=' + encodeURIComponent(movie.id || ''));
     if (movie.imdb_id) p.push('imdb_id=' + encodeURIComponent(movie.imdb_id));
@@ -101,7 +157,7 @@
     p.push('serial=' + isSerial);
     p.push('year=' + encodeURIComponent(((movie.release_date || movie.first_air_date || '0000') + '').slice(0, 4)));
     p.push('source=' + encodeURIComponent(movie.source || 'tmdb'));
-    return base + '/lite/alloha?' + p.join('&');
+    return p.join('&');
   }
 
   function parseDataItems(html) {
@@ -141,6 +197,10 @@
     return title.trim() || 'Источник';
   }
 
+  /* -------------------------------------------------------------------------- */
+  /*                       РЕЗОЛВИНГ И ЗАПУСК ВИДЕО                             */
+  /* -------------------------------------------------------------------------- */
+
   function resolveStream(item) {
     if (item.method === 'play' && item.url) return Promise.resolve(extractBestStream(item));
     if (item.method === 'call' && item.url) {
@@ -156,14 +216,23 @@
   function extractBestStream(res) {
     var playUrl = res.url || '';
     var qualities = res.quality || {};
+
     if (isForce4K()) {
       var target = getTargetQuality() + 'p';
       if (qualities[target]) playUrl = qualities[target];
       else if (qualities['2160p']) playUrl = qualities['2160p'];
       else if (qualities['1440p'] && getTargetQuality() !== '1080') playUrl = qualities['1440p'];
     }
-    if (playUrl.indexOf(' or ') !== -1) playUrl = playUrl.split(' or ')[0];
-    return { url: playUrl, quality: qualities, subtitles: res.subtitles || [] };
+
+    if (playUrl.indexOf(' or ') !== -1) {
+      playUrl = playUrl.split(' or ')[0];
+    }
+
+    return {
+      url: playUrl,
+      quality: qualities,
+      subtitles: res.subtitles || []
+    };
   }
 
   function startPlayer(movie, chosen, resolved, playlist) {
@@ -197,6 +266,10 @@
       }));
     }
   }
+
+  /* -------------------------------------------------------------------------- */
+  /*                       ИНТЕРАКТИВНОЕ МЕНЮ ВЫБОРА                            */
+  /* -------------------------------------------------------------------------- */
 
   function pickItem(title, items) {
     return new Promise(function (resolve) {
@@ -271,14 +344,30 @@
     if (!movie) return;
     try { Lampa.Loading.start(); } catch (e) {}
 
-    walkTree(movie, buildSearchUrl(movie), {}, 0).catch(function (err) {
-      try { Lampa.Loading.stop(); } catch (e) {}
-      var msg = (err && err.message) || String(err) || 'Ошибка загрузки';
-      try { Lampa.Noty.show('4K Онлайн: ' + msg); } catch (x) {}
-    });
+    var query = buildSearchParams(movie);
+
+    // Сначала ищем в Alloha (главный источник 4K UHD)
+    requestWithMirrors('/lite/alloha?' + query)
+      .then(function (html) {
+        var items = parseDataItems(html);
+        if (items.length > 0) {
+          return walkTree(movie, getActiveServers()[0] + '/lite/alloha?' + query, {}, 0);
+        }
+        // Если в Alloha нет, ищем в Filmix
+        return walkTree(movie, getActiveServers()[0] + '/lite/filmix?' + query, {}, 0);
+      })
+      .catch(function (err) {
+        try { Lampa.Loading.stop(); } catch (e) {}
+        var msg = (err && err.message) || String(err) || 'Ошибка загрузки';
+        console.error('4K Plugin Error:', err);
+        try { Lampa.Noty.show('4K Онлайн: ' + msg); } catch (x) {}
+      });
   }
 
-  // Добавление кнопки «Смотреть 4K» на карточку
+  /* -------------------------------------------------------------------------- */
+  /*                          КНОПКА НА КАРТОЧКЕ ФИЛЬМА                         */
+  /* -------------------------------------------------------------------------- */
+
   Lampa.Listener.follow('full', function (e) {
     if (e.type === 'complite') {
       try {
@@ -302,22 +391,36 @@
     }
   });
 
-  // Пункт в контекстном меню карточки
+  /* -------------------------------------------------------------------------- */
+  /*                       РЕГИСТРАЦИЯ В КОНТЕКСТНОМ МЕНЮ                       */
+  /* -------------------------------------------------------------------------- */
+
   try {
-    Lampa.Manifest.plugins = {
+    var manifest = {
       type: 'video',
       version: PLUGIN_VERSION,
       name: 'Онлайн 4K',
-      description: 'Бесплатный просмотр 4K UHD без торрентов',
+      description: 'Бесплатный онлайн просмотр в 4K UHD без торрентов',
       component: 'online_4k',
       onContextMenu: function () {
         return { name: 'Смотреть в 4K UHD', description: 'Поиск 2160p онлайн' };
       },
       onContextLauch: function (movie) { launch(movie); }
     };
+
+    var plugins = Lampa.Manifest.plugins;
+    if (Array.isArray(plugins)) {
+      for (var i = plugins.length - 1; i >= 0; i--) {
+        if (plugins[i] && plugins[i].component === 'online_4k') plugins.splice(i, 1);
+      }
+    }
+    Lampa.Manifest.plugins = manifest;
   } catch (e) {}
 
-  // Настройки в интерфейсе Lampa
+  /* -------------------------------------------------------------------------- */
+  /*                             НАСТРОЙКИ В МЕНЮ                               */
+  /* -------------------------------------------------------------------------- */
+
   try {
     if (Lampa.SettingsApi && Lampa.SettingsApi.addComponent) {
       Lampa.SettingsApi.addComponent({
@@ -328,8 +431,8 @@
 
       Lampa.SettingsApi.addParam({
         component: 'online_4k',
-        param: { name: 'fourk_server_url', type: 'input', default: DEFAULT_SERVER },
-        field: { name: 'Адрес сервера / балансера', description: 'Сервер для поиска 4K потоков (Lampac)' }
+        param: { name: 'fourk_server_url', type: 'input', default: '' },
+        field: { name: 'Пользовательский сервер', description: 'Оставьте пустым для встроенных серверов' }
       });
 
       Lampa.SettingsApi.addParam({
@@ -366,4 +469,7 @@
   } catch (e) {}
 
   applyPlayerSettings();
+
+  window.plugin_online_4k_launch = launch;
+  console.log('4K Plugin loaded. Version: ' + PLUGIN_VERSION);
 })();
